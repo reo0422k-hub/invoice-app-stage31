@@ -1,16 +1,26 @@
 import { useEffect, useMemo, useState } from 'react'
 import './App.css'
-import { defaultCompanySettings, demoInvoices, invoiceStatuses, taxRate } from './mockData'
+import { defaultCompanySettings, taxRate } from './mockData'
+import {
+  buildFriendlyError,
+  deleteInvoiceRecord,
+  fetchInvoiceDetail,
+  fetchWorkspaceData,
+  invoiceStatusOptions,
+  saveInvoiceRecord,
+  updateInvoiceStatusRecord,
+} from './lib/invoiceData'
+import { buildAuthError } from './lib/authErrors'
+import { supabase, supabaseConfigError } from './lib/supabase'
 
-const invoiceStorageKey = 'invoice-app:invoices'
 const settingsStorageKey = 'invoice-app:settings'
 
 const navigationItems = [
-  { id: 'dashboard', label: 'ダッシュボード' },
-  { id: 'invoices', label: '請求書一覧' },
-  { id: 'editor', label: '請求書作成・編集' },
-  { id: 'approvals', label: '承認待ち一覧' },
-  { id: 'settings', label: '設定' },
+  { id: 'dashboard', label: 'ダッシュボード', path: '/dashboard' },
+  { id: 'invoices', label: '請求書一覧', path: '/invoices' },
+  { id: 'editor', label: '請求書作成・編集', path: '/invoices/new' },
+  { id: 'approvals', label: '承認待ち一覧', path: '/approvals' },
+  { id: 'settings', label: '設定', path: '/settings' },
 ]
 
 const statusLabels = {
@@ -19,6 +29,7 @@ const statusLabels = {
   送付済み: 'sent',
   入金済み: 'paid',
   期限超過: 'overdue',
+  差し戻し: 'rejected',
 }
 
 const currencyFormatter = new Intl.NumberFormat('ja-JP', {
@@ -33,34 +44,29 @@ const dateFormatter = new Intl.DateTimeFormat('ja-JP', {
   day: '2-digit',
 })
 
-function App() {
-  const [activeView, setActiveView] = useState('dashboard')
+function App({ session }) {
+  const userId = session?.user?.id ?? ''
+  const [activeView, setActiveView] = useState(() => getViewFromPath(window.location.pathname))
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
-  const [editingInvoiceId, setEditingInvoiceId] = useState(null)
-  const [invoices, setInvoices] = useState(() => loadInvoices())
+  const [editingInvoiceId, setEditingInvoiceId] = useState(() =>
+    getViewFromPath(window.location.pathname) === 'editor'
+      ? new URLSearchParams(window.location.search).get('id')
+      : null,
+  )
+  const [workspace, setWorkspace] = useState({ invoices: [], clients: [] })
+  const [workspaceState, setWorkspaceState] = useState({ loading: true, error: '' })
+  const [editorInvoice, setEditorInvoice] = useState(null)
+  const [editorState, setEditorState] = useState({ loading: false, error: '' })
   const [companySettings, setCompanySettings] = useState(() => loadSettings())
-  const [isLoading, setIsLoading] = useState(true)
   const [loadingTick, setLoadingTick] = useState(0)
-  const [notice, setNotice] = useState('')
-
-  useEffect(() => {
-    window.localStorage.setItem(invoiceStorageKey, JSON.stringify(invoices))
-  }, [invoices])
+  const [processingInvoiceId, setProcessingInvoiceId] = useState('')
+  const [deletingInvoiceId, setDeletingInvoiceId] = useState('')
+  const [notice, setNotice] = useState(null)
+  const [loggingOut, setLoggingOut] = useState(false)
 
   useEffect(() => {
     window.localStorage.setItem(settingsStorageKey, JSON.stringify(companySettings))
   }, [companySettings])
-
-  useEffect(() => {
-    setMobileMenuOpen(false)
-    setIsLoading(true)
-
-    const timerId = window.setTimeout(() => {
-      setIsLoading(false)
-    }, 650)
-
-    return () => window.clearTimeout(timerId)
-  }, [activeView, loadingTick])
 
   useEffect(() => {
     if (!notice) {
@@ -68,19 +74,146 @@ function App() {
     }
 
     const timerId = window.setTimeout(() => {
-      setNotice('')
-    }, 2800)
+      setNotice(null)
+    }, 3200)
 
     return () => window.clearTimeout(timerId)
   }, [notice])
 
-  const metrics = useMemo(() => buildMetrics(invoices), [invoices])
-  const editingInvoice = invoices.find((invoice) => invoice.id === editingInvoiceId) ?? null
+  useEffect(() => {
+    let isCancelled = false
+
+    const loadWorkspace = async () => {
+      setMobileMenuOpen(false)
+      setWorkspaceState({ loading: true, error: '' })
+
+      const startedAt = Date.now()
+
+      try {
+        if (supabaseConfigError) {
+          throw new Error(supabaseConfigError)
+        }
+
+        if (!userId) {
+          throw new Error('ログイン情報を確認できません。もう一度ログインしてください')
+        }
+
+        const data = await fetchWorkspaceData(userId)
+        await waitForMinimumLoading(startedAt, 650)
+
+        if (!isCancelled) {
+          setWorkspace(data)
+          setWorkspaceState({ loading: false, error: '' })
+        }
+      } catch (error) {
+        await waitForMinimumLoading(startedAt, 650)
+
+        if (!isCancelled) {
+          setWorkspaceState({
+            loading: false,
+            error: buildFriendlyError(
+              error,
+              '請求書の取得に失敗しました。もう一度お試しください',
+            ),
+          })
+        }
+      }
+    }
+
+    loadWorkspace()
+
+    return () => {
+      isCancelled = true
+    }
+  }, [activeView, loadingTick, userId])
+
+  useEffect(() => {
+    if (activeView !== 'editor' || !editingInvoiceId || workspaceState.error) {
+      setEditorInvoice(null)
+      setEditorState({ loading: false, error: '' })
+      return undefined
+    }
+
+    let isCancelled = false
+
+    const loadEditorInvoice = async () => {
+      setEditorState({ loading: true, error: '' })
+      const startedAt = Date.now()
+
+      try {
+        const detail = await fetchInvoiceDetail(editingInvoiceId, userId)
+        await waitForMinimumLoading(startedAt, 400)
+
+        if (!isCancelled) {
+          setEditorInvoice(detail)
+          setEditorState({ loading: false, error: '' })
+        }
+      } catch (error) {
+        await waitForMinimumLoading(startedAt, 400)
+
+        if (!isCancelled) {
+          setEditorState({
+            loading: false,
+            error: buildFriendlyError(error, '請求書の取得に失敗しました。もう一度お試しください'),
+          })
+        }
+      }
+    }
+
+    loadEditorInvoice()
+
+    return () => {
+      isCancelled = true
+    }
+  }, [activeView, editingInvoiceId, workspaceState.error, userId])
+
+  const metrics = useMemo(() => buildMetrics(workspace.invoices), [workspace.invoices])
 
   const navigateTo = (view, nextInvoiceId = null) => {
     setMobileMenuOpen(false)
     setEditingInvoiceId(nextInvoiceId)
     setActiveView(view)
+    const nextPath = view === 'editor' && nextInvoiceId
+      ? `/invoices/edit?id=${encodeURIComponent(nextInvoiceId)}`
+      : navigationItems.find((item) => item.id === view)?.path ?? '/dashboard'
+    window.history.pushState({}, '', nextPath)
+  }
+
+  useEffect(() => {
+    const handlePopState = () => {
+      const nextView = getViewFromPath(window.location.pathname)
+      const invoiceId = nextView === 'editor'
+        ? new URLSearchParams(window.location.search).get('id')
+        : null
+      setActiveView(nextView)
+      setEditingInvoiceId(invoiceId)
+      setMobileMenuOpen(false)
+    }
+
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [])
+
+  const handleLogout = async () => {
+    setLoggingOut(true)
+    setNotice(null)
+    setWorkspace({ invoices: [], clients: [] })
+    setEditorInvoice(null)
+    setEditingInvoiceId(null)
+
+    try {
+      const { error } = await supabase.auth.signOut()
+      if (error) throw error
+      window.history.replaceState({}, '', '/login')
+    } catch (error) {
+      setNotice({ type: 'error', message: buildAuthError(error, 'logout') })
+      setLoggingOut(false)
+      triggerReload()
+    }
+  }
+
+  const triggerReload = () => {
+    setLoadingTick((current) => current + 1)
   }
 
   const handleCreateInvoice = () => {
@@ -91,137 +224,164 @@ function App() {
     navigateTo('editor', invoiceId)
   }
 
-  const handleSaveInvoice = (formValues) => {
-    const normalizedInvoice = normalizeInvoice({
-      ...formValues,
-      id: formValues.id ?? crypto.randomUUID(),
-      invoiceNumber: formValues.invoiceNumber ?? buildNextInvoiceNumber(invoices),
-      updatedAt: new Date().toISOString(),
-    })
+  const handleSaveInvoice = async (payload) => {
+    try {
+      await saveInvoiceRecord({
+        invoice: payload,
+        currentInvoice: editingInvoiceId ? editorInvoice : null,
+        clients: workspace.clients,
+        userId,
+      })
 
-    setInvoices((currentInvoices) => {
-      const exists = currentInvoices.some((invoice) => invoice.id === normalizedInvoice.id)
-      if (exists) {
-        return currentInvoices.map((invoice) =>
-          invoice.id === normalizedInvoice.id ? normalizedInvoice : invoice,
-        )
+      setNotice({
+        type: 'success',
+        message: editingInvoiceId ? '請求書を更新しました。' : '請求書を保存しました。',
+      })
+      navigateTo('invoices')
+      return { ok: true }
+    } catch (error) {
+      return {
+        ok: false,
+        error: buildFriendlyError(error, '請求書を保存できませんでした'),
       }
-
-      return [normalizedInvoice, ...currentInvoices]
-    })
-
-    setNotice(formValues.id ? '請求書を更新しました。' : '請求書を保存しました。')
-    navigateTo('invoices')
+    }
   }
 
-  const handleUpdateInvoiceStatus = (invoiceId, nextStatus, message) => {
-    setInvoices((currentInvoices) =>
-      currentInvoices.map((invoice) =>
-        invoice.id === invoiceId
-          ? normalizeInvoice({
-              ...invoice,
-              status: nextStatus,
-              updatedAt: new Date().toISOString(),
-            })
-          : invoice,
-      ),
+  const handleDeleteInvoice = async (invoiceId) => {
+    const targetInvoice = workspace.invoices.find((invoice) => invoice.id === invoiceId)
+    const confirmed = window.confirm(
+      `${targetInvoice?.invoiceNumber ?? 'この請求書'}を削除しますか？\n関連する品目と入金情報も削除されます。`,
     )
-    setNotice(message)
+
+    if (!confirmed) {
+      return
+    }
+
+    setDeletingInvoiceId(invoiceId)
+
+    try {
+      await deleteInvoiceRecord(invoiceId, userId)
+      setNotice({ type: 'success', message: '請求書を削除しました。' })
+      triggerReload()
+    } catch (error) {
+      setNotice({
+        type: 'error',
+        message: buildFriendlyError(error, '請求書を削除できませんでした'),
+      })
+    } finally {
+      setDeletingInvoiceId('')
+    }
+  }
+
+  const handleUpdateInvoiceStatus = async (invoiceId, nextStatus, successMessage) => {
+    setProcessingInvoiceId(invoiceId)
+
+    try {
+      await updateInvoiceStatusRecord(invoiceId, nextStatus, userId)
+      setNotice({ type: 'success', message: successMessage })
+      triggerReload()
+    } catch (error) {
+      setNotice({
+        type: 'error',
+        message: buildFriendlyError(error, 'ステータスの更新に失敗しました'),
+      })
+    } finally {
+      setProcessingInvoiceId('')
+    }
   }
 
   const handleSaveSettings = (nextSettings) => {
     setCompanySettings(nextSettings)
-    setNotice('設定を保存しました。')
-  }
-
-  const handleClearInvoices = () => {
-    setInvoices([])
-    setNotice('請求書データを空にしました。')
-  }
-
-  const handleRestoreDemoData = () => {
-    setInvoices(demoInvoices.map((invoice) => normalizeInvoice(invoice)))
-    setNotice('ダミーデータを復元しました。')
-  }
-
-  const handleClearPendingInvoices = () => {
-    setInvoices((currentInvoices) =>
-      currentInvoices.map((invoice) =>
-        invoice.status === '承認待ち'
-          ? normalizeInvoice({
-              ...invoice,
-              status: '下書き',
-              updatedAt: new Date().toISOString(),
-            })
-          : invoice,
-      ),
-    )
-    setNotice('承認待ちの請求書を確認済みにしました。')
-  }
-
-  const handlePreviewLoading = () => {
-    setLoadingTick((current) => current + 1)
+    setNotice({ type: 'success', message: '設定を保存しました。' })
   }
 
   const headerTitle = navigationItems.find((item) => item.id === activeView)?.label ?? '請求書管理'
-  const headerDescription = getViewDescription(activeView, editingInvoice)
+  const headerDescription = getViewDescription(activeView, editingInvoiceId)
 
   let content = null
 
-  if (isLoading) {
-    content = <LoadingScreen activeView={activeView} />
-  } else if (activeView === 'dashboard') {
-    content = (
-      <DashboardScreen
-        metrics={metrics}
-        onCreateInvoice={handleCreateInvoice}
-        onEditInvoice={handleEditInvoice}
-      />
-    )
+  if (activeView === 'dashboard') {
+    if (workspaceState.loading) {
+      content = <LoadingScreen activeView={activeView} />
+    } else if (workspaceState.error) {
+      content = <ErrorState message={workspaceState.error} onRetry={triggerReload} />
+    } else {
+      content = (
+        <DashboardScreen
+          metrics={metrics}
+          onCreateInvoice={handleCreateInvoice}
+          onEditInvoice={handleEditInvoice}
+        />
+      )
+    }
   } else if (activeView === 'invoices') {
-    content = (
-      <InvoicesScreen
-        invoices={invoices}
-        onCreateInvoice={handleCreateInvoice}
-        onEditInvoice={handleEditInvoice}
-        onClearInvoices={handleClearInvoices}
-        onRestoreDemoData={handleRestoreDemoData}
-      />
-    )
+    if (workspaceState.loading) {
+      content = <LoadingScreen activeView={activeView} />
+    } else if (workspaceState.error) {
+      content = <ErrorState message={workspaceState.error} onRetry={triggerReload} />
+    } else {
+      content = (
+        <InvoicesScreen
+          invoices={workspace.invoices}
+          onCreateInvoice={handleCreateInvoice}
+          onDeleteInvoice={handleDeleteInvoice}
+          onEditInvoice={handleEditInvoice}
+          deletingInvoiceId={deletingInvoiceId}
+        />
+      )
+    }
   } else if (activeView === 'editor') {
-    content = (
-      <InvoiceEditorScreen
-        invoice={editingInvoice}
-        invoices={invoices}
-        onCancel={() => navigateTo('invoices')}
-        onSave={handleSaveInvoice}
-      />
-    )
+    if (workspaceState.loading) {
+      content = <LoadingScreen activeView={activeView} />
+    } else if (workspaceState.error) {
+      content = <ErrorState message={workspaceState.error} onRetry={triggerReload} />
+    } else if (editingInvoiceId && editorState.loading) {
+      content = <LoadingScreen activeView={activeView} />
+    } else if (editingInvoiceId && editorState.error) {
+      content = <ErrorState message={editorState.error} onRetry={triggerReload} />
+    } else {
+      content = (
+        <InvoiceEditorScreen
+          invoice={editingInvoiceId ? editorInvoice : null}
+          invoices={workspace.invoices}
+          clients={workspace.clients}
+          onCancel={() => navigateTo('invoices')}
+          onSave={handleSaveInvoice}
+        />
+      )
+    }
   } else if (activeView === 'approvals') {
-    content = (
-      <ApprovalsScreen
-        invoices={invoices}
-        onEditInvoice={handleEditInvoice}
-        onApprove={(invoiceId) =>
-          handleUpdateInvoiceStatus(invoiceId, '送付済み', '請求書を承認しました。')
-        }
-        onReject={(invoiceId) =>
-          handleUpdateInvoiceStatus(invoiceId, '下書き', '請求書を差し戻しました。')
-        }
-      />
-    )
+    if (workspaceState.loading) {
+      content = <LoadingScreen activeView={activeView} />
+    } else if (workspaceState.error) {
+      content = <ErrorState message={workspaceState.error} onRetry={triggerReload} />
+    } else {
+      content = (
+        <ApprovalsScreen
+          invoices={workspace.invoices}
+          onEditInvoice={handleEditInvoice}
+          onApprove={(invoiceId) =>
+            handleUpdateInvoiceStatus(invoiceId, '送付済み', '請求書を承認しました。')
+          }
+          onReject={(invoiceId) =>
+            handleUpdateInvoiceStatus(invoiceId, '差し戻し', '請求書を差し戻しました。')
+          }
+          processingInvoiceId={processingInvoiceId}
+        />
+      )
+    }
   } else if (activeView === 'settings') {
     content = (
       <SettingsScreen
         companySettings={companySettings}
         onSave={handleSaveSettings}
-        onRestoreDemoData={handleRestoreDemoData}
-        onClearInvoices={handleClearInvoices}
-        onClearPendingInvoices={handleClearPendingInvoices}
-        onPreviewLoading={handlePreviewLoading}
+        onPreviewLoading={triggerReload}
+        supabaseError={workspaceState.error || supabaseConfigError}
       />
     )
   }
+
+  const isBusy = workspaceState.loading || editorState.loading
 
   return (
     <div className="app-shell">
@@ -237,7 +397,7 @@ function App() {
             className="sidebar-close"
             onClick={() => setMobileMenuOpen(false)}
             aria-label="メニューを閉じる"
-            disabled={isLoading}
+            disabled={isBusy}
           >
             ×
           </button>
@@ -249,21 +409,29 @@ function App() {
               key={item.id}
               type="button"
               className={`nav-button ${activeView === item.id ? 'is-active' : ''}`}
-              onClick={() => navigateTo(item.id, item.id === 'editor' ? editingInvoiceId : null)}
-              disabled={isLoading}
+              onClick={() => navigateTo(item.id, null)}
+              disabled={isBusy}
             >
               <span>{item.label}</span>
-              {item.id === 'approvals' ? (
-                <strong>{metrics.statusCounts['承認待ち']}</strong>
-              ) : null}
+              {item.id === 'approvals' ? <strong>{metrics.statusCounts['承認待ち']}</strong> : null}
             </button>
           ))}
         </nav>
 
         <div className="sidebar-summary">
-          <p>今月の請求</p>
-          <strong>{formatCurrency(metrics.monthlyTotal)}</strong>
-          <span>{metrics.monthlyCount} 件</span>
+          <p>請求総額</p>
+          <strong>{formatCurrency(metrics.totalAmount)}</strong>
+          <span>{metrics.invoiceCount} 件</span>
+        </div>
+
+        <div className="account-block">
+          <div>
+            <span>ログイン中</span>
+            <strong title={session.user.email ?? ''}>{session.user.email ?? 'メールアドレス未設定'}</strong>
+          </div>
+          <button type="button" className="logout-button" onClick={handleLogout} disabled={loggingOut}>
+            {loggingOut ? 'ログアウト中...' : 'ログアウト'}
+          </button>
         </div>
       </aside>
 
@@ -281,7 +449,7 @@ function App() {
               className="menu-button"
               onClick={() => setMobileMenuOpen((current) => !current)}
               aria-label="メニューを開く"
-              disabled={isLoading}
+              disabled={isBusy}
             >
               <span />
               <span />
@@ -302,14 +470,18 @@ function App() {
               type="button"
               className="primary-button"
               onClick={handleCreateInvoice}
-              disabled={isLoading}
+              disabled={isBusy || Boolean(workspaceState.error)}
             >
               新規請求書
             </button>
           </div>
         </header>
 
-        {notice ? <div className="notice-banner">{notice}</div> : null}
+        {notice ? (
+          <div className={`notice-banner ${notice.type === 'error' ? 'is-error' : ''}`}>
+            {notice.message}
+          </div>
+        ) : null}
 
         <main className="content-shell">{content}</main>
       </div>
@@ -322,16 +494,16 @@ function DashboardScreen({ metrics, onCreateInvoice, onEditInvoice }) {
     <section className="page-section">
       <div className="section-heading">
         <div>
-          <h3>今月のサマリー</h3>
-          <p>請求の進捗と入金状況をひと目で確認できます。</p>
+          <h3>請求サマリー</h3>
+          <p>Supabase上の請求書と入金情報をもとに集計しています。</p>
         </div>
       </div>
 
       <div className="stats-grid">
-        <StatCard label="今月の請求総額" value={formatCurrency(metrics.monthlyTotal)} />
-        <StatCard label="入金済み金額" value={formatCurrency(metrics.monthlyPaid)} />
-        <StatCard label="未入金金額" value={formatCurrency(metrics.monthlyOutstanding)} />
-        <StatCard label="請求書件数" value={`${metrics.monthlyCount} 件`} />
+        <StatCard label="請求総額" value={formatCurrency(metrics.totalAmount)} />
+        <StatCard label="入金済み金額" value={formatCurrency(metrics.paidAmount)} />
+        <StatCard label="未入金金額" value={formatCurrency(metrics.outstandingAmount)} />
+        <StatCard label="請求書件数" value={`${metrics.invoiceCount} 件`} />
       </div>
 
       <div className="split-grid">
@@ -382,12 +554,12 @@ function DashboardScreen({ metrics, onCreateInvoice, onEditInvoice }) {
           <div className="panel-header">
             <div>
               <h3>ステータス別件数</h3>
-              <p>請求書の滞留ポイントを把握できます。</p>
+              <p>請求書の進捗をリアルタイムに確認できます。</p>
             </div>
           </div>
 
           <div className="status-summary-grid">
-            {invoiceStatuses.map((status) => (
+            {invoiceStatusOptions.map((status) => (
               <article key={status} className={`status-summary-card is-${statusLabels[status]}`}>
                 <StatusBadge status={status} />
                 <strong>{metrics.statusCounts[status]} 件</strong>
@@ -403,9 +575,9 @@ function DashboardScreen({ metrics, onCreateInvoice, onEditInvoice }) {
 function InvoicesScreen({
   invoices,
   onCreateInvoice,
+  onDeleteInvoice,
   onEditInvoice,
-  onClearInvoices,
-  onRestoreDemoData,
+  deletingInvoiceId,
 }) {
   const [keyword, setKeyword] = useState('')
   const [statusFilter, setStatusFilter] = useState('すべて')
@@ -422,12 +594,9 @@ function InvoicesScreen({
       const matchesStatus = statusFilter === 'すべて' || invoice.status === statusFilter
       const matchesKeyword =
         normalizedKeyword.length === 0 ||
-        [
-          invoice.invoiceNumber,
-          invoice.clientName,
-          invoice.subject,
-          invoice.notes,
-        ].some((value) => value.toLowerCase().includes(normalizedKeyword))
+        [invoice.invoiceNumber, invoice.clientName, invoice.subject, invoice.notes]
+          .filter(Boolean)
+          .some((value) => value.toLowerCase().includes(normalizedKeyword))
 
       return matchesStatus && matchesKeyword
     })
@@ -438,15 +607,7 @@ function InvoicesScreen({
       <div className="section-heading">
         <div>
           <h3>請求書一覧</h3>
-          <p>検索、絞り込み、編集から日次の運用を進められます。</p>
-        </div>
-        <div className="inline-actions">
-          <button type="button" className="secondary-button" onClick={onRestoreDemoData}>
-            ダミーデータ復元
-          </button>
-          <button type="button" className="secondary-button subtle" onClick={onClearInvoices}>
-            全件クリア
-          </button>
+          <p>Supabase上の請求書を検索、絞り込み、編集、削除できます。</p>
         </div>
       </div>
 
@@ -469,7 +630,7 @@ function InvoicesScreen({
               onChange={(event) => setStatusFilter(event.target.value)}
             >
               <option value="すべて">すべて</option>
-              {invoiceStatuses.map((status) => (
+              {invoiceStatusOptions.map((status) => (
                 <option key={status} value={status}>
                   {status}
                 </option>
@@ -509,13 +670,23 @@ function InvoicesScreen({
                         <StatusBadge status={invoice.status} />
                       </td>
                       <td>
-                        <button
-                          type="button"
-                          className="text-button"
-                          onClick={() => onEditInvoice(invoice.id)}
-                        >
-                          編集
-                        </button>
+                        <div className="table-actions">
+                          <button
+                            type="button"
+                            className="text-button"
+                            onClick={() => onEditInvoice(invoice.id)}
+                          >
+                            編集
+                          </button>
+                          <button
+                            type="button"
+                            className="text-button danger-text"
+                            onClick={() => onDeleteInvoice(invoice.id)}
+                            disabled={deletingInvoiceId === invoice.id}
+                          >
+                            {deletingInvoiceId === invoice.id ? '削除中...' : '削除'}
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   ))}
@@ -548,13 +719,23 @@ function InvoicesScreen({
                       <dd>{formatCurrency(invoice.total)}</dd>
                     </div>
                   </dl>
-                  <button
-                    type="button"
-                    className="secondary-button"
-                    onClick={() => onEditInvoice(invoice.id)}
-                  >
-                    編集する
-                  </button>
+                  <div className="card-action-stack">
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => onEditInvoice(invoice.id)}
+                    >
+                      編集する
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-button subtle"
+                      onClick={() => onDeleteInvoice(invoice.id)}
+                      disabled={deletingInvoiceId === invoice.id}
+                    >
+                      {deletingInvoiceId === invoice.id ? '削除中...' : '削除する'}
+                    </button>
+                  </div>
                 </article>
               ))}
             </div>
@@ -565,11 +746,15 @@ function InvoicesScreen({
   )
 }
 
-function InvoiceEditorScreen({ invoice, invoices, onCancel, onSave }) {
+function InvoiceEditorScreen({ invoice, invoices, clients, onCancel, onSave }) {
   const [formState, setFormState] = useState(() => buildInitialFormState(invoice))
+  const [isSaving, setIsSaving] = useState(false)
+  const [saveError, setSaveError] = useState('')
 
   useEffect(() => {
     setFormState(buildInitialFormState(invoice))
+    setSaveError('')
+    setIsSaving(false)
   }, [invoice])
 
   const subtotal = calculateSubtotal(formState.items)
@@ -590,7 +775,8 @@ function InvoiceEditorScreen({ invoice, invoices, onCancel, onSave }) {
         item.id === itemId
           ? {
               ...item,
-              [field]: field === 'name' ? value : Number(value),
+              [field]:
+                field === 'name' || field === 'description' ? value : Number(value),
             }
           : item,
       ),
@@ -602,7 +788,13 @@ function InvoiceEditorScreen({ invoice, invoices, onCancel, onSave }) {
       ...current,
       items: [
         ...current.items,
-        { id: crypto.randomUUID(), name: '', quantity: 1, unitPrice: 0 },
+        {
+          id: crypto.randomUUID(),
+          name: '',
+          description: '',
+          quantity: 1,
+          unitPrice: 0,
+        },
       ],
     }))
   }
@@ -617,25 +809,31 @@ function InvoiceEditorScreen({ invoice, invoices, onCancel, onSave }) {
     }))
   }
 
-  const handleSubmit = (event) => {
+  const handleSubmit = async (event) => {
     event.preventDefault()
+    setSaveError('')
 
     const sanitizedItems = formState.items
       .map((item) => ({
         ...item,
         name: item.name.trim(),
+        description: item.description.trim(),
         quantity: Number(item.quantity) || 0,
         unitPrice: Number(item.unitPrice) || 0,
       }))
       .filter((item) => item.name && item.quantity > 0)
 
     if (sanitizedItems.length === 0) {
+      setSaveError('少なくとも1件の品目を入力してください')
       return
     }
 
-    const payload = {
+    setIsSaving(true)
+
+    const result = await onSave({
       ...invoice,
       ...formState,
+      invoiceNumber: formState.invoiceNumber || buildNextInvoiceNumber(invoices),
       clientName: formState.clientName.trim(),
       subject: formState.subject.trim(),
       notes: formState.notes.trim(),
@@ -643,9 +841,12 @@ function InvoiceEditorScreen({ invoice, invoices, onCancel, onSave }) {
       subtotal,
       tax,
       total,
-    }
+    })
 
-    onSave(payload)
+    if (!result.ok) {
+      setSaveError(result.error)
+      setIsSaving(false)
+    }
   }
 
   return (
@@ -653,9 +854,11 @@ function InvoiceEditorScreen({ invoice, invoices, onCancel, onSave }) {
       <div className="section-heading">
         <div>
           <h3>{invoice ? '請求書を編集' : '請求書を作成'}</h3>
-          <p>品目ごとの小計と消費税を自動計算します。</p>
+          <p>保存時に取引先、請求書、品目を順にSupabaseへ反映します。</p>
         </div>
       </div>
+
+      {saveError ? <div className="notice-banner is-error">{saveError}</div> : null}
 
       <form className="panel form-panel" onSubmit={handleSubmit}>
         <div className="form-grid">
@@ -663,11 +866,17 @@ function InvoiceEditorScreen({ invoice, invoices, onCancel, onSave }) {
             <span>取引先名</span>
             <input
               type="text"
+              list="client-suggestions"
               required
               value={formState.clientName}
               onChange={(event) => updateField('clientName', event.target.value)}
               placeholder="株式会社サンプル"
             />
+            <datalist id="client-suggestions">
+              {clients.map((client) => (
+                <option key={client.id} value={client.name} />
+              ))}
+            </datalist>
           </label>
 
           <label className="field">
@@ -707,7 +916,7 @@ function InvoiceEditorScreen({ invoice, invoices, onCancel, onSave }) {
               value={formState.status}
               onChange={(event) => updateField('status', event.target.value)}
             >
-              {invoiceStatuses.map((status) => (
+              {invoiceStatusOptions.map((status) => (
                 <option key={status} value={status}>
                   {status}
                 </option>
@@ -722,7 +931,7 @@ function InvoiceEditorScreen({ invoice, invoices, onCancel, onSave }) {
               <h3>品目</h3>
               <p>数量と単価から小計を自動計算します。</p>
             </div>
-            <button type="button" className="secondary-button" onClick={addItem}>
+            <button type="button" className="secondary-button" onClick={addItem} disabled={isSaving}>
               品目を追加
             </button>
           </div>
@@ -736,13 +945,13 @@ function InvoiceEditorScreen({ invoice, invoices, onCancel, onSave }) {
                     type="button"
                     className="text-button"
                     onClick={() => removeItem(item.id)}
-                    disabled={formState.items.length === 1}
+                    disabled={formState.items.length === 1 || isSaving}
                   >
                     削除
                   </button>
                 </div>
 
-                <div className="line-item-grid">
+                <div className="line-items-detail-grid">
                   <label className="field line-item-name">
                     <span>品目</span>
                     <input
@@ -754,32 +963,44 @@ function InvoiceEditorScreen({ invoice, invoices, onCancel, onSave }) {
                     />
                   </label>
 
-                  <label className="field">
-                    <span>数量</span>
+                  <label className="field field-full">
+                    <span>説明</span>
                     <input
-                      type="number"
-                      min="1"
-                      required
-                      value={item.quantity}
-                      onChange={(event) => updateItem(item.id, 'quantity', event.target.value)}
+                      type="text"
+                      value={item.description}
+                      onChange={(event) => updateItem(item.id, 'description', event.target.value)}
+                      placeholder="品目の説明"
                     />
                   </label>
 
-                  <label className="field">
-                    <span>単価</span>
-                    <input
-                      type="number"
-                      min="0"
-                      step="100"
-                      required
-                      value={item.unitPrice}
-                      onChange={(event) => updateItem(item.id, 'unitPrice', event.target.value)}
-                    />
-                  </label>
+                  <div className="line-item-grid">
+                    <label className="field">
+                      <span>数量</span>
+                      <input
+                        type="number"
+                        min="1"
+                        required
+                        value={item.quantity}
+                        onChange={(event) => updateItem(item.id, 'quantity', event.target.value)}
+                      />
+                    </label>
 
-                  <div className="total-box">
-                    <span>小計</span>
-                    <strong>{formatCurrency(item.quantity * item.unitPrice)}</strong>
+                    <label className="field">
+                      <span>単価</span>
+                      <input
+                        type="number"
+                        min="0"
+                        step="100"
+                        required
+                        value={item.unitPrice}
+                        onChange={(event) => updateItem(item.id, 'unitPrice', event.target.value)}
+                      />
+                    </label>
+
+                    <div className="total-box">
+                      <span>小計</span>
+                      <strong>{formatCurrency(item.quantity * item.unitPrice)}</strong>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -813,11 +1034,11 @@ function InvoiceEditorScreen({ invoice, invoices, onCancel, onSave }) {
         </div>
 
         <div className="form-actions">
-          <button type="button" className="secondary-button" onClick={onCancel}>
+          <button type="button" className="secondary-button" onClick={onCancel} disabled={isSaving}>
             キャンセル
           </button>
-          <button type="submit" className="primary-button">
-            保存する
+          <button type="submit" className="primary-button" disabled={isSaving}>
+            {isSaving ? '保存中...' : '保存する'}
           </button>
         </div>
       </form>
@@ -831,7 +1052,7 @@ function InvoiceEditorScreen({ invoice, invoices, onCancel, onSave }) {
         </div>
 
         <div className="preview-grid">
-          <InfoPair label="請求書番号" value={invoice?.invoiceNumber ?? nextPreviewNumber(invoices)} />
+          <InfoPair label="請求書番号" value={formState.invoiceNumber || buildNextInvoiceNumber(invoices)} />
           <InfoPair label="取引先名" value={formState.clientName || '-'} />
           <InfoPair label="件名" value={formState.subject || '-'} />
           <InfoPair label="ステータス" value={formState.status} />
@@ -843,7 +1064,7 @@ function InvoiceEditorScreen({ invoice, invoices, onCancel, onSave }) {
   )
 }
 
-function ApprovalsScreen({ invoices, onEditInvoice, onApprove, onReject }) {
+function ApprovalsScreen({ invoices, onEditInvoice, onApprove, onReject, processingInvoiceId }) {
   const pendingInvoices = invoices.filter((invoice) => invoice.status === '承認待ち')
 
   return (
@@ -851,7 +1072,7 @@ function ApprovalsScreen({ invoices, onEditInvoice, onApprove, onReject }) {
       <div className="section-heading">
         <div>
           <h3>承認待ち一覧</h3>
-          <p>承認待ちの請求書を確認し、承認または差し戻しできます。</p>
+          <p>status が pending の請求書を Supabase から表示しています。</p>
         </div>
       </div>
 
@@ -885,6 +1106,7 @@ function ApprovalsScreen({ invoices, onEditInvoice, onApprove, onReject }) {
                     type="button"
                     className="secondary-button"
                     onClick={() => onEditInvoice(invoice.id)}
+                    disabled={processingInvoiceId === invoice.id}
                   >
                     編集
                   </button>
@@ -892,15 +1114,17 @@ function ApprovalsScreen({ invoices, onEditInvoice, onApprove, onReject }) {
                     type="button"
                     className="secondary-button subtle"
                     onClick={() => onReject(invoice.id)}
+                    disabled={processingInvoiceId === invoice.id}
                   >
-                    差し戻し
+                    {processingInvoiceId === invoice.id ? '処理中...' : '差し戻し'}
                   </button>
                   <button
                     type="button"
                     className="primary-button"
                     onClick={() => onApprove(invoice.id)}
+                    disabled={processingInvoiceId === invoice.id}
                   >
-                    承認
+                    {processingInvoiceId === invoice.id ? '処理中...' : '承認'}
                   </button>
                 </div>
               </article>
@@ -912,14 +1136,7 @@ function ApprovalsScreen({ invoices, onEditInvoice, onApprove, onReject }) {
   )
 }
 
-function SettingsScreen({
-  companySettings,
-  onSave,
-  onRestoreDemoData,
-  onClearInvoices,
-  onClearPendingInvoices,
-  onPreviewLoading,
-}) {
+function SettingsScreen({ companySettings, onSave, onPreviewLoading, supabaseError }) {
   const [formState, setFormState] = useState(companySettings)
 
   useEffect(() => {
@@ -943,9 +1160,11 @@ function SettingsScreen({
       <div className="section-heading">
         <div>
           <h3>設定</h3>
-          <p>会社情報と振込先情報をアプリ内に保存します。</p>
+          <p>設定画面はローカル保存のまま維持しています。</p>
         </div>
       </div>
+
+      {supabaseError ? <div className="notice-banner is-error">{supabaseError}</div> : null}
 
       <form className="panel form-panel" onSubmit={handleSubmit}>
         <div className="form-grid">
@@ -1021,42 +1240,14 @@ function SettingsScreen({
         </div>
 
         <div className="form-actions">
-          <button type="button" className="secondary-button" onClick={onRestoreDemoData}>
-            ダミーデータ復元
+          <button type="button" className="secondary-button" onClick={onPreviewLoading}>
+            読み込みを再表示
           </button>
           <button type="submit" className="primary-button">
             設定を保存
           </button>
         </div>
       </form>
-
-      <section className="panel preview-panel">
-        <div className="panel-header">
-          <div>
-            <h3>表示確認</h3>
-            <p>空状態と読み込み中の確認用です。必要に応じて画面状態を切り替えられます。</p>
-          </div>
-        </div>
-
-        <div className="inline-actions">
-          <button type="button" className="secondary-button" onClick={onPreviewLoading}>
-            読み込みを再表示
-          </button>
-          <button type="button" className="secondary-button subtle" onClick={onClearInvoices}>
-            請求書を0件にする
-          </button>
-          <button
-            type="button"
-            className="secondary-button subtle"
-            onClick={onClearPendingInvoices}
-          >
-            承認待ちを0件にする
-          </button>
-          <button type="button" className="secondary-button" onClick={onRestoreDemoData}>
-            ダミーデータ復元
-          </button>
-        </div>
-      </section>
     </section>
   )
 }
@@ -1095,6 +1286,22 @@ function NoResultsState({ onReset }) {
         条件をリセット
       </button>
     </div>
+  )
+}
+
+function ErrorState({ message, onRetry }) {
+  return (
+    <section className="page-section">
+      <div className="panel error-panel">
+        <h3>エラーが発生しました</h3>
+        <p>{message}</p>
+        <div className="error-actions">
+          <button type="button" className="primary-button" onClick={onRetry}>
+            再読み込み
+          </button>
+        </div>
+      </div>
+    </section>
   )
 }
 
@@ -1219,42 +1426,14 @@ function InfoPair({ label, value }) {
   )
 }
 
-function loadInvoices() {
-  const fallback = demoInvoices.map((invoice) => normalizeInvoice(invoice))
-  const stored = loadFromStorage(invoiceStorageKey, fallback)
-
-  return Array.isArray(stored) ? stored.map((invoice) => normalizeInvoice(invoice)) : fallback
-}
-
-function loadSettings() {
-  return loadFromStorage(settingsStorageKey, defaultCompanySettings)
-}
-
-function loadFromStorage(key, fallbackValue) {
-  try {
-    const stored = window.localStorage.getItem(key)
-    if (!stored) {
-      return fallbackValue
-    }
-
-    return JSON.parse(stored)
-  } catch {
-    return fallbackValue
-  }
-}
-
 function buildMetrics(invoices) {
-  const now = new Date()
-  const monthlyInvoices = invoices.filter((invoice) => {
-    const issuedAt = new Date(invoice.issueDate)
-    return issuedAt.getFullYear() === now.getFullYear() && issuedAt.getMonth() === now.getMonth()
-  })
-
-  const monthlyTotal = monthlyInvoices.reduce((sum, invoice) => sum + invoice.total, 0)
-  const monthlyPaid = monthlyInvoices
-    .filter((invoice) => invoice.status === '入金済み')
-    .reduce((sum, invoice) => sum + invoice.total, 0)
-  const statusCounts = invoiceStatuses.reduce(
+  const totalAmount = invoices.reduce((sum, invoice) => sum + invoice.total, 0)
+  const paidAmount = invoices.reduce(
+    (sum, invoice) =>
+      sum + invoice.payments.reduce((paymentSum, payment) => paymentSum + payment.amount, 0),
+    0,
+  )
+  const statusCounts = invoiceStatusOptions.reduce(
     (accumulator, status) => ({
       ...accumulator,
       [status]: invoices.filter((invoice) => invoice.status === status).length,
@@ -1266,52 +1445,13 @@ function buildMetrics(invoices) {
     .slice(0, 5)
 
   return {
-    monthlyTotal,
-    monthlyPaid,
-    monthlyOutstanding: monthlyTotal - monthlyPaid,
-    monthlyCount: monthlyInvoices.length,
+    totalAmount,
+    paidAmount,
+    outstandingAmount: Math.max(totalAmount - paidAmount, 0),
+    invoiceCount: invoices.length,
     recentInvoices,
     statusCounts,
   }
-}
-
-function normalizeInvoice(invoice) {
-  const items = (invoice.items ?? []).map((item) => ({
-    ...item,
-    quantity: Number(item.quantity) || 0,
-    unitPrice: Number(item.unitPrice) || 0,
-  }))
-  const subtotal = calculateSubtotal(items)
-  const tax = Math.round(subtotal * taxRate)
-  const total = subtotal + tax
-
-  return {
-    ...invoice,
-    items,
-    subtotal,
-    tax,
-    total,
-    status: applyOverdueStatus(invoice.status, invoice.dueDate),
-  }
-}
-
-function calculateSubtotal(items) {
-  return items.reduce((sum, item) => sum + item.quantity * item.unitPrice, 0)
-}
-
-function applyOverdueStatus(currentStatus, dueDate) {
-  if (currentStatus === '入金済み' || currentStatus === '下書き' || currentStatus === '承認待ち') {
-    return currentStatus
-  }
-
-  const today = startOfDay(new Date())
-  const due = startOfDay(new Date(dueDate))
-
-  if (Number.isNaN(due.getTime())) {
-    return currentStatus
-  }
-
-  return due < today ? '期限超過' : currentStatus
 }
 
 function buildInitialFormState(invoice) {
@@ -1325,24 +1465,43 @@ function buildInitialFormState(invoice) {
       dueDate: invoice.dueDate,
       status: invoice.status,
       notes: invoice.notes,
-      items: invoice.items.map((item) => ({ ...item })),
+      items: invoice.items.map((item) => ({
+        id: item.id,
+        name: item.name,
+        description: item.description ?? '',
+        quantity: item.quantity,
+        unitPrice: item.unitPrice,
+      })),
     }
   }
 
   return {
+    invoiceNumber: '',
     clientName: '',
     subject: '',
     issueDate: toDateInputValue(new Date()),
     dueDate: toDateInputValue(addDays(new Date(), 14)),
     status: '下書き',
     notes: '',
-    items: [{ id: crypto.randomUUID(), name: '', quantity: 1, unitPrice: 0 }],
+    items: [
+      {
+        id: crypto.randomUUID(),
+        name: '',
+        description: '',
+        quantity: 1,
+        unitPrice: 0,
+      },
+    ],
   }
 }
 
-function getViewDescription(activeView, editingInvoice) {
+function calculateSubtotal(items) {
+  return items.reduce((sum, item) => sum + Number(item.quantity) * Number(item.unitPrice), 0)
+}
+
+function getViewDescription(activeView, editingInvoiceId) {
   if (activeView === 'dashboard') {
-    return '請求業務の状況を確認'
+    return 'Supabaseの請求業務データを確認'
   }
 
   if (activeView === 'invoices') {
@@ -1350,7 +1509,7 @@ function getViewDescription(activeView, editingInvoice) {
   }
 
   if (activeView === 'editor') {
-    return editingInvoice ? '既存の請求書を更新' : '新しい請求書を登録'
+    return editingInvoiceId ? '既存の請求書を更新' : '新しい請求書を登録'
   }
 
   if (activeView === 'approvals') {
@@ -1360,21 +1519,12 @@ function getViewDescription(activeView, editingInvoice) {
   return '会社情報を保存'
 }
 
-function formatCurrency(value) {
-  return currencyFormatter.format(value)
-}
-
-function formatDate(value) {
-  if (!value) {
-    return '-'
-  }
-
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) {
-    return value
-  }
-
-  return dateFormatter.format(date)
+function getViewFromPath(pathname) {
+  if (pathname === '/invoices/new' || pathname === '/invoices/edit') return 'editor'
+  if (pathname === '/invoices') return 'invoices'
+  if (pathname === '/approvals') return 'approvals'
+  if (pathname === '/settings') return 'settings'
+  return 'dashboard'
 }
 
 function buildNextInvoiceNumber(invoices) {
@@ -1390,15 +1540,36 @@ function buildNextInvoiceNumber(invoices) {
   return `${prefix}-${String(nextSequence).padStart(3, '0')}`
 }
 
-function nextPreviewNumber(invoices) {
-  return buildNextInvoiceNumber(invoices)
+function loadSettings() {
+  try {
+    const stored = window.localStorage.getItem(settingsStorageKey)
+    return stored ? JSON.parse(stored) : defaultCompanySettings
+  } catch {
+    return defaultCompanySettings
+  }
+}
+
+function formatCurrency(value) {
+  return currencyFormatter.format(value || 0)
+}
+
+function formatDate(value) {
+  if (!value) {
+    return '-'
+  }
+
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return value
+  }
+
+  return dateFormatter.format(date)
 }
 
 function toDateInputValue(date) {
   const year = date.getFullYear()
   const month = String(date.getMonth() + 1).padStart(2, '0')
   const day = String(date.getDate()).padStart(2, '0')
-
   return `${year}-${month}-${day}`
 }
 
@@ -1408,8 +1579,15 @@ function addDays(date, days) {
   return nextDate
 }
 
-function startOfDay(date) {
-  return new Date(date.getFullYear(), date.getMonth(), date.getDate())
+async function waitForMinimumLoading(startedAt, minimumMs) {
+  const elapsed = Date.now() - startedAt
+  const remaining = minimumMs - elapsed
+
+  if (remaining > 0) {
+    await new Promise((resolve) => {
+      window.setTimeout(resolve, remaining)
+    })
+  }
 }
 
 export default App
